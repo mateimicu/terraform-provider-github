@@ -69,6 +69,12 @@ func RateLimitedHTTPClient(client *http.Client, writeDelay, readDelay, retryDela
 		client.Transport = NewRetryTransport(client.Transport, WithRetryDelay(retryDelay), WithRetryableErrors(retryableErrors), WithMaxRetries(maxRetries))
 	}
 
+	// Work around go-github bug where RulesetReviewer.ID is *int64 but the
+	// GitHub API returns it as a JSON string. This transport must be outermost
+	// so it fixes the response body before go-github's JSON decoder sees it.
+	// See: https://github.com/integrations/terraform-provider-github/issues/3214
+	client.Transport = NewRulesetResponseFixTransport(client.Transport)
+
 	return client
 }
 

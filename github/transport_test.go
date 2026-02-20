@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -511,4 +512,180 @@ type mockResponse struct {
 	StatusCode      int
 	ResponseHeaders map[string]string
 	ResponseBody    string
+}
+
+func TestIsRulesetEndpoint(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected bool
+	}{
+		{"/repos/owner/repo/rulesets", true},
+		{"/repos/owner/repo/rulesets/123", true},
+		{"/orgs/myorg/rulesets", true},
+		{"/orgs/myorg/rulesets/456", true},
+		{"/api/v3/repos/owner/repo/rulesets", true},
+		{"/api/v3/orgs/myorg/rulesets/789", true},
+		{"/repos/owner/repo/pulls", false},
+		{"/orgs/myorg/teams", false},
+		{"/users/someone", false},
+	}
+
+	for _, tt := range tests {
+		got := isRulesetEndpoint(tt.path)
+		if got != tt.expected {
+			t.Errorf("isRulesetEndpoint(%q) = %v, want %v", tt.path, got, tt.expected)
+		}
+	}
+}
+
+func TestFixReviewerIDs(t *testing.T) {
+	t.Run("converts string reviewer id to number", func(t *testing.T) {
+		input := `{"id":13056455,"reviewer":{"id":"3827094","type":"Team"}}`
+		result := string(fixReviewerIDs([]byte(input)))
+
+		if strings.Contains(result, `"id":"3827094"`) {
+			t.Errorf("Expected quoted id to be unquoted, got: %s", result)
+		}
+		if !strings.Contains(result, `"id":3827094`) {
+			t.Errorf("Expected unquoted id 3827094, got: %s", result)
+		}
+		// The ruleset's own numeric id should be unchanged
+		if !strings.Contains(result, `"id":13056455`) {
+			t.Errorf("Expected ruleset id to remain unchanged, got: %s", result)
+		}
+	})
+
+	t.Run("preserves already-numeric reviewer id", func(t *testing.T) {
+		input := `{"reviewer":{"id":12345,"type":"Team"}}`
+		result := string(fixReviewerIDs([]byte(input)))
+		if result != input {
+			t.Errorf("Expected no change, got: %s", result)
+		}
+	})
+
+	t.Run("handles multiple reviewers with string ids", func(t *testing.T) {
+		input := `{"required_reviewers":[{"reviewer":{"id":"111","type":"Team"}},{"reviewer":{"id":"222","type":"Team"}}]}`
+		result := string(fixReviewerIDs([]byte(input)))
+
+		if strings.Contains(result, `"id":"`) {
+			t.Errorf("Expected all quoted ids to be unquoted, got: %s", result)
+		}
+		if !strings.Contains(result, `"id":111`) || !strings.Contains(result, `"id":222`) {
+			t.Errorf("Expected both ids as numbers, got: %s", result)
+		}
+	})
+
+	t.Run("does not change non-numeric string ids", func(t *testing.T) {
+		input := `{"id":"not-a-number"}`
+		result := string(fixReviewerIDs([]byte(input)))
+		if result != input {
+			t.Errorf("Expected no change for non-numeric id, got: %s", result)
+		}
+	})
+
+	t.Run("returns unchanged when no quoted ids", func(t *testing.T) {
+		input := `{"id":123,"name":"test-ruleset"}`
+		result := string(fixReviewerIDs([]byte(input)))
+		if result != input {
+			t.Errorf("Expected no change, got: %s", result)
+		}
+	})
+}
+
+func TestRulesetResponseFixTransport(t *testing.T) {
+	// Simulate the real GitHub API response where reviewer.id is a string
+	rulesetResponse := `{
+		"id": 13056455,
+		"name": "test-rule",
+		"enforcement": "active",
+		"rules": [
+			{
+				"type": "pull_request",
+				"parameters": {
+					"dismiss_stale_reviews_on_push": true,
+					"require_code_owner_review": false,
+					"require_last_push_approval": true,
+					"required_approving_review_count": 1,
+					"required_review_thread_resolution": false,
+					"required_reviewers": [
+						{
+							"minimum_approvals": 1,
+							"file_patterns": ["*"],
+							"reviewer": {
+								"id": "3827094",
+								"type": "Team"
+							}
+						}
+					]
+				}
+			}
+		]
+	}`
+
+	ts := githubApiMock([]*mockResponse{
+		{
+			ExpectedUri:  "/repos/test/repo/rulesets/123?includes_parents=false",
+			ResponseBody: rulesetResponse,
+			StatusCode:   200,
+		},
+	})
+	defer ts.Close()
+
+	httpClient := &http.Client{}
+	httpClient.Transport = NewRulesetResponseFixTransport(http.DefaultTransport)
+
+	client := github.NewClient(httpClient)
+	u, _ := url.Parse(ts.URL + "/")
+	client.BaseURL = u
+
+	ruleset, _, err := client.Repositories.GetRuleset(context.Background(), "test", "repo", 123, false)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if ruleset.GetID() != 13056455 {
+		t.Errorf("Expected ruleset ID 13056455, got %d", ruleset.GetID())
+	}
+
+	if ruleset.Rules == nil || ruleset.Rules.PullRequest == nil {
+		t.Fatal("Expected pull request rules to be present")
+	}
+
+	if len(ruleset.Rules.PullRequest.RequiredReviewers) != 1 {
+		t.Fatalf("Expected 1 required reviewer, got %d", len(ruleset.Rules.PullRequest.RequiredReviewers))
+	}
+
+	reviewer := ruleset.Rules.PullRequest.RequiredReviewers[0]
+	if reviewer.Reviewer == nil {
+		t.Fatal("Expected reviewer to be present")
+	}
+	if reviewer.Reviewer.GetID() != 3827094 {
+		t.Errorf("Expected reviewer ID 3827094, got %d", reviewer.Reviewer.GetID())
+	}
+}
+
+func TestRulesetResponseFixTransport_nonRulesetEndpoint(t *testing.T) {
+	ts := githubApiMock([]*mockResponse{
+		{
+			ExpectedUri:  "/repos/test/blah",
+			ResponseBody: `{"id": 5678}`,
+			StatusCode:   200,
+		},
+	})
+	defer ts.Close()
+
+	httpClient := &http.Client{}
+	httpClient.Transport = NewRulesetResponseFixTransport(http.DefaultTransport)
+
+	client := github.NewClient(httpClient)
+	u, _ := url.Parse(ts.URL + "/")
+	client.BaseURL = u
+
+	r, _, err := client.Repositories.Get(context.Background(), "test", "blah")
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	if r.GetID() != 5678 {
+		t.Errorf("Expected ID 5678, got %d", r.GetID())
+	}
 }

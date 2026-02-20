@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -308,4 +310,75 @@ func WithRetryDelay(d time.Duration) RetryTransportOption {
 	return func(rt *RetryTransport) {
 		rt.retryDelay = d
 	}
+}
+
+// rulesetResponseFixTransport works around a bug in go-github where
+// RulesetReviewer.ID is defined as *int64 but the GitHub API returns
+// it as a JSON string (e.g., "id":"3827094" instead of "id":3827094).
+// This transport intercepts responses for ruleset endpoints and converts
+// the reviewer.id field from string to number before go-github parses it.
+//
+// See: https://github.com/integrations/terraform-provider-github/issues/3214
+//
+// TODO: Remove this transport once go-github fixes RulesetReviewer.ID handling.
+type rulesetResponseFixTransport struct {
+	transport http.RoundTripper
+}
+
+func NewRulesetResponseFixTransport(rt http.RoundTripper) *rulesetResponseFixTransport {
+	return &rulesetResponseFixTransport{transport: rt}
+}
+
+func (t *rulesetResponseFixTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.transport.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+
+	// Only fix responses for ruleset endpoints
+	if !isRulesetEndpoint(req.URL.Path) {
+		return resp, err
+	}
+
+	// Only fix successful responses with a body
+	if resp.Body == nil || resp.StatusCode >= 400 {
+		return resp, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	fixed := fixReviewerIDs(body)
+
+	resp.Body = io.NopCloser(bytes.NewReader(fixed))
+	resp.ContentLength = int64(len(fixed))
+
+	return resp, nil
+}
+
+// isRulesetEndpoint checks if the URL path is a ruleset API endpoint.
+func isRulesetEndpoint(path string) bool {
+	// Match patterns like:
+	//   /repos/{owner}/{repo}/rulesets
+	//   /repos/{owner}/{repo}/rulesets/{id}
+	//   /orgs/{org}/rulesets
+	//   /orgs/{org}/rulesets/{id}
+	// Also handle GHES API prefix: /api/v3/repos/...
+	return strings.Contains(path, "/rulesets")
+}
+
+// quotedIDPattern matches JSON "id" fields with string values that contain
+// only digits, e.g. "id":"3827094". In ruleset responses, the only quoted
+// numeric "id" fields are reviewer IDs — the ruleset's own "id" is already
+// an unquoted number.
+var quotedIDPattern = regexp.MustCompile(`"id"\s*:\s*"(\d+)"`)
+
+// fixReviewerIDs converts any "id":"<digits>" to "id":<digits> in the
+// response body. This fixes the GitHub API returning reviewer IDs as
+// strings when go-github expects int64.
+func fixReviewerIDs(data []byte) []byte {
+	return quotedIDPattern.ReplaceAll(data, []byte(`"id":$1`))
 }
